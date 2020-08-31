@@ -1,0 +1,130 @@
+#!/usr/bin/python3
+
+import fcntl
+import os
+import signal
+import socket
+import sys
+import time
+
+LOG_FILE = '/tmp/daemon.log'
+
+# Flag to indicate termination
+SIG_TERM = False
+
+def log(msg):
+    '''
+    Write msg to LOG_FILE; lock the file before writing.
+    '''
+    log_file = open(LOG_FILE, 'a')
+    try:
+        fcntl.flock(log_file, fcntl.LOCK_EX)
+        log_file.write(f'{time.time():.2f}: {msg}\n')
+    finally:
+        # Closing the file releases locks (See fcntl(2))
+        log_file.close()
+
+def signal_handler(signum, frame):
+    '''
+    Handle SIGTERM
+     - set a flag to tell us to stop
+     - raise InterruptedError to interrupt active syscalls
+      -> See PEP475
+    '''
+
+    # Do as little as possible in the handler - set a flag and ensure the sleep
+    # is interrupted.
+    if signum == signal.SIGTERM:
+        global SIG_TERM
+        SIG_TERM = True
+        raise InterruptedError
+
+def main():
+    '''
+    Become a daemon and log to LOG_FILE
+    '''
+
+    log('Parent Start')
+    log(f'pid/sid/pgrp: {os.getpid()}/{os.getsid(0)}/{os.getpgrp()}')
+
+    # fork to allow the parent to exit; the child will be adopted by init (pid 1)
+    #
+    # NOTE: os.fork may raise OSError, but otherwise returns 0 in child and the pid
+    # of the child process in the parent
+    if os.fork():
+        log('After fork in Parent - about to exit 0')
+        os._exit(0)
+    else:
+        log('After fork in First Child')
+        log(f'pid/sid/pgrp: {os.getpid()}/{os.getsid(0)}/{os.getpgrp()}')
+
+    # Ensure we don't block any unmounts
+    log('Set current directory to /')
+    os.chdir('/')
+
+    # Ensure we don't interfere with permissions of any files created
+    log('Set umask to 0')
+    os.umask(0)
+
+    # Become progress group and session group leader to ensure process has no controlling terminal
+    log('Call setsid()')
+    os.setsid()
+    log(f'pid/sid/pgrp: {os.getpid()}/{os.getsid(0)}/{os.getpgrp()}')
+
+    # fork once more so that the session group leader can exit and so that the
+    # daemon process is not a session group leader => this means we can never
+    # regain a controlling terminal
+    log('Before second fork in First Child')
+    if os.fork():
+        log('After second fork in First Child - about to exit 0')
+        os._exit(0)
+    else:
+        log('After second fork in Second Child')
+        log(f'pid/sid/pgrp: {os.getpid()}/{os.getsid(0)}/{os.getpgrp()}')
+
+    # Arrange for SIGTERM signals to be handled by signal_handler
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # We know that we only have std{in,out,err} open. Close them to remove
+    # dependencies.
+    log('Close file descriptors')
+    os.closerange(0, os.sysconf('SC_OPEN_MAX'))
+
+    # Reopen /dev/null as std{in,out,err} - important as many things
+    # assume that fds {0,1,2} are open.
+    log('Redirect stdin/stdout/stderr to /dev/null')
+    stdin = open(os.devnull, 'r')
+    stdout = open(os.devnull, 'a+')
+    stderr = open(os.devnull, 'a+')
+    os.dup2(stdin.fileno(), sys.stdin.fileno())
+    os.dup2(stdout.fileno(), sys.stdout.fileno())
+    os.dup2(stderr.fileno(), sys.stderr.fileno())
+
+    # Requirement: Allows only 1 instance of itself to run at a time.
+    # Normally/often achieved by writing a pidfile, but this approach based on
+    # https://bit.ly/32IrVeb, while less portable, seemed more robust (not to
+    # mention interesting...)
+    abs_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        abs_socket.bind('\0daemon-demo')
+    except OSError as err:
+        if err.errno == 98:
+            log('Already running - exiting 2')
+            sys.exit(2)
+        else:
+            log('Unexpected Error - exit 1')
+            sys.exit(1)
+
+    # Main loop of the daemon - we could do anything here, but for the purposes
+    # of the demo, just log a message every 10 seconds
+    while True:
+        try:
+            log('Main Loop... working hard...')
+            time.sleep(10)
+        except InterruptedError:
+            if SIG_TERM: # Indication that we received a SIGTERM - so exit cleanly
+                log('Caught SIGTERM - Exiting 0')
+                sys.exit(0)
+
+if __name__ == '__main__':
+    main()
